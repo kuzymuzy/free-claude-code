@@ -134,6 +134,16 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         proxy_attr="opencode_go_proxy",
         capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
     ),
+    "opencode_free": ProviderDescriptor(
+        provider_id="opencode_free",
+        transport_type="openai_chat",
+        credential_env=None,
+        credential_url=None,
+        credential_attr=None,
+        default_base_url=OPENCODE_DEFAULT_BASE,
+        proxy_attr="opencode_proxy",
+        capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
+    ),
     "wafer": ProviderDescriptor(
         provider_id="wafer",
         transport_type="anthropic_messages",
