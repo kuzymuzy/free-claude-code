@@ -99,9 +99,12 @@ def _create_opencode(config: ProviderConfig, _settings: Settings) -> BaseProvide
 
     return OpenCodeProvider(config)
 
+
 def _create_opencode_free(config: ProviderConfig, _settings: Settings) -> BaseProvider:
     from providers.opencode_free import OpenCodeFreeProvider
+
     return OpenCodeFreeProvider(config)
+
 
 def _create_opencode_go(config: ProviderConfig, _settings: Settings) -> BaseProvider:
     from providers.opencode import OpenCodeProvider

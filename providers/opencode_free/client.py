@@ -11,11 +11,21 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from core.anthropic import SSEBuilder, map_stop_reason
+from core.anthropic import (
+    ContentType,
+    HeuristicToolParser,
+    SSEBuilder,
+    ThinkTagParser,
+    map_stop_reason,
+)
 from providers.base import BaseProvider, ProviderConfig
 from providers.defaults import OPENCODE_DEFAULT_BASE
 from providers.model_listing import extract_openai_model_ids
 from providers.opencode.request import build_request_body
+from providers.transports.openai_chat.tool_calls import (
+    OpenAIToolCallAssembler,
+    iter_heuristic_tool_use_sse,
+)
 
 _POOL_SIZE = 8
 _COOLDOWN_SKIPS = 3  # skip a session N times after a 429
@@ -154,12 +164,13 @@ class OpenCodeFreeProvider(BaseProvider):
             transport = (
                 httpx.AsyncHTTPTransport(proxy=self._proxy) if self._proxy else None
             )
-            async with httpx.AsyncClient(
-                timeout=self._timeout,
-                transport=transport,
-            ) as client, client.stream(
-                "POST", url, headers=headers, json=body
-            ) as resp:
+            async with (
+                httpx.AsyncClient(
+                    timeout=self._timeout,
+                    transport=transport,
+                ) as client,
+                client.stream("POST", url, headers=headers, json=body) as resp,
+            ):
                 if resp.status_code == 429:
                     _pool.rotate(session_id)
                     continue
@@ -167,9 +178,10 @@ class OpenCodeFreeProvider(BaseProvider):
 
                 yield sse.message_start()
 
+                think_parser = ThinkTagParser()
+                heuristic_parser = HeuristicToolParser()
+                tool_assembler = OpenAIToolCallAssembler()
                 finish_reason: str | None = None
-                started_thinking = False
-                started_text = False
 
                 async for chunk in _openai_sse_chunks(resp):
                     choices = chunk.get("choices")
@@ -178,38 +190,80 @@ class OpenCodeFreeProvider(BaseProvider):
                     choice = choices[0]
                     delta = choice.get("delta", {})
 
-                    # Reasoning content → Anthropic thinking block
-                    reasoning = delta.get("reasoning_content")
-                    if reasoning:
-                        if started_text:
-                            yield sse.stop_text_block()
-                            started_text = False
-                        if not started_thinking:
-                            yield sse.start_thinking_block()
-                            started_thinking = True
-                        yield sse.emit_thinking_delta(reasoning)
-
-                    # Text content
-                    content = delta.get("content")
-                    if content:
-                        if started_thinking:
-                            yield sse.stop_thinking_block()
-                            started_thinking = False
-                        if not started_text:
-                            yield sse.start_text_block()
-                            started_text = True
-                        yield sse.emit_text_delta(content)
-
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
 
-                # Close any open content blocks
-                if started_thinking:
-                    yield sse.stop_thinking_block()
-                if started_text:
-                    yield sse.stop_text_block()
+                    # Reasoning content → Anthropic thinking block
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        for event in sse.ensure_thinking_block():
+                            yield event
+                        yield sse.emit_thinking_delta(reasoning)
 
-                yield sse.message_delta(map_stop_reason(finish_reason), None)
+                    # Text content — feed through ThinkTagParser → HeuristicToolParser
+                    content = delta.get("content")
+                    if content:
+                        for part in think_parser.feed(content):
+                            if part.type == ContentType.THINKING:
+                                for event in sse.ensure_thinking_block():
+                                    yield event
+                                yield sse.emit_thinking_delta(part.content)
+                            else:
+                                (
+                                    filtered_text,
+                                    detected_tools,
+                                ) = heuristic_parser.feed(part.content)
+                                if filtered_text:
+                                    for event in sse.ensure_text_block():
+                                        yield event
+                                    yield sse.emit_text_delta(filtered_text)
+                                for tool_use in detected_tools:
+                                    for event in iter_heuristic_tool_use_sse(
+                                        sse, tool_use
+                                    ):
+                                        yield event
+
+                    # Structured tool calls from OpenAI SSE format
+                    tool_calls = delta.get("tool_calls")
+                    if tool_calls:
+                        for event in sse.close_content_blocks():
+                            yield event
+                        for tc in tool_calls:
+                            tc_info = {
+                                "index": tc.get("index", 0),
+                                "id": tc.get("id"),
+                                "function": {
+                                    "name": tc.get("function", {}).get("name"),
+                                    "arguments": tc.get("function", {}).get(
+                                        "arguments", ""
+                                    ),
+                                },
+                            }
+                            for event in tool_assembler.process_tool_call(tc_info, sse):
+                                yield event
+
+                # Flush remaining content from parsers
+                remaining = think_parser.flush()
+                if remaining:
+                    if remaining.type == ContentType.THINKING:
+                        for event in sse.ensure_thinking_block():
+                            yield event
+                        yield sse.emit_thinking_delta(remaining.content)
+                    elif remaining.type == ContentType.TEXT:
+                        for event in sse.ensure_text_block():
+                            yield event
+                        yield sse.emit_text_delta(remaining.content)
+
+                for tool_use in heuristic_parser.flush():
+                    for event in iter_heuristic_tool_use_sse(sse, tool_use):
+                        yield event
+
+                # Close all open blocks
+                for event in sse.close_all_blocks():
+                    yield event
+
+                output_tokens = sse.estimate_output_tokens()
+                yield sse.message_delta(map_stop_reason(finish_reason), output_tokens)
                 yield sse.message_stop()
                 return
 
